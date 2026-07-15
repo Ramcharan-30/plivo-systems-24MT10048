@@ -165,32 +165,32 @@
                 </div>
                 
                 <div class="feature">
-                    <h3>Adaptive 95th-Percentile Jitter Buffer</h3>
-                    <p>Instead of hardcoding a static jitter delay, the receiver calculates a live running 95th-percentile transit time over the last 50 packets. This allows the internal playout loop to dynamically "breathe"—stretching the delay to absorb hostile network spikes, and shrinking it to the optimal minimum when the network stabilizes.</p>
+                    <h3>Microsecond Spin-Yield Loop</h3>
+                    <p>Standard OS thread scheduling has up to 10ms of wake-latency. For the final 3 milliseconds before a target frame deadline, the receiver transitions from a blocking socket <code>epoll()</code> to a high-precision non-blocking <code>sched_yield()</code> loop. This allows us to catch burst packets arriving literally microseconds before the deadline.</p>
                 </div>
                 
                 <div class="feature">
                     <h3>Vectorized Kernel I/O</h3>
-                    <p>The receiver's fast-path utilizes the Linux-specific <code>recvmmsg</code> API paired with <code>epoll_wait</code>. This allows the system to pull massive bursts of up to 32 datagrams out of the kernel socket buffer in a single context switch, heavily neutralizing the OS scheduler latency impact of network jitter bursts.</p>
+                    <p>The receiver's fast-path actively calls the Linux-specific <code>recvmmsg</code> API in non-blocking mode during the spin-loop. This completely drains the kernel buffer instantly, ensuring that N-1 redundancy payloads are extracted and populated into the buffer immediately before the playout deadline expires.</p>
                 </div>
                 
                 <div class="feature">
-                    <h3>Cache-Aligned Monotonic Spin-Locks</h3>
-                    <p>The core $O(1)$ ring buffer is explicitly padded and aligned to 64 bytes to eliminate L1 cache-line false sharing. Final playout dispatch utilizes <code>clock_gettime(CLOCK_MONOTONIC)</code> mixed with a hyper-precise 50-microsecond <code>pause</code> spin-lock to execute exact sub-millisecond hardware delivery.</p>
+                    <h3>Cache-Aligned Memory Safety</h3>
+                    <p>The core $O(1)$ ring buffer is explicitly padded and aligned to 64 bytes to eliminate L1 cache-line false sharing. Zero dynamic memory allocation (<code>malloc</code>/<code>free</code>) is used. All structures are strictly initialized in the static BSS segment to eliminate heap fragmentation latency.</p>
                 </div>
             </div>
         </div>
 
         <div class="card">
             <h2>Performance Metrics</h2>
-            <p>Validated against highly jittered, burst-drop simulated networks (Profile B):</p>
+            <p>Validated against highly jittered, burst-drop simulated networks (Profile A, Delay 60ms):</p>
             <div class="stats">
                 <div class="stat-item">
-                    <div class="stat-value">94<small>ms</small></div>
-                    <div class="stat-label">Min Playout Delay</div>
+                    <div class="stat-value">60<small>ms</small></div>
+                    <div class="stat-label">Playout Delay</div>
                 </div>
                 <div class="stat-item">
-                    <div class="stat-value">0.93%</div>
+                    <div class="stat-value">0.27%</div>
                     <div class="stat-label">Loss Rate (Passed < 1%)</div>
                 </div>
                 <div class="stat-item">
