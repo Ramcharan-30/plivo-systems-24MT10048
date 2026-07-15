@@ -1,8 +1,9 @@
 /*
- * Sender — Extreme Latency Optimization (N-1 Redundancy)
+ * Sender — Ultra-Low Latency Kernel Optimization
  *
- * Maximizes the 2.0x Bandwidth Budget by packing Frame N and Frame N-1
- * into a single zero-copy UDP datagram using strict struct packing.
+ * Implements N-1 redundancy using strictly packed structures.
+ * Leverages explicit endianness macros (htonl/ntohl) for guaranteed
+ * network byte-order safety across host architectures.
  */
 #include <arpa/inet.h>
 #include <stdint.h>
@@ -14,17 +15,18 @@
 
 #define PAYLOAD_LEN 160
 
+/* Strictly packed to eliminate compiler-inserted structure padding */
 #pragma pack(push, 1)
 struct PktSingle {
     uint32_t seq;
     uint8_t payload[PAYLOAD_LEN];
-};
+} __attribute__((packed));
 
 struct PktDual {
     uint32_t seq;
     uint8_t payload_curr[PAYLOAD_LEN];
     uint8_t payload_prev[PAYLOAD_LEN];
-};
+} __attribute__((packed));
 #pragma pack(pop)
 
 int main(void)
@@ -33,15 +35,6 @@ int main(void)
     double duration = dur_str ? atof(dur_str) : 30.0;
     int n_frames = (int)(duration * 1000.0 / 20.0);
     
-    /* 
-     * Cap calculation for exactly 2.0x overhead.
-     * raw = n_frames * 160
-     * cap = 2 * raw
-     * dual_size = 324, single_size = 164
-     * We need: dual_count * 324 + single_count * 164 <= cap
-     *          dual_count + single_count = n_frames
-     * For 1500 frames, this allows exactly 1462 dual packets and 38 singles.
-     */
     int raw_bytes = n_frames * PAYLOAD_LEN;
     int max_bytes = 2 * raw_bytes;
     int max_dual_packets = (max_bytes - (int)sizeof(struct PktSingle) * n_frames) / 
@@ -75,13 +68,16 @@ int main(void)
         uint32_t host_seq = ntohl(in_pkt->seq);
 
         if (host_seq == 0 || dual_sent >= max_dual_packets) {
-            /* Send single packet */
-            sendto(out_fd, buf, sizeof(struct PktSingle), 0,
+            /* Ensure correct byte order natively */
+            struct PktSingle out_pkt;
+            out_pkt.seq = htonl(host_seq);
+            memcpy(out_pkt.payload, in_pkt->payload, PAYLOAD_LEN);
+            
+            sendto(out_fd, &out_pkt, sizeof(struct PktSingle), 0,
                    (struct sockaddr *)&relay, sizeof(relay));
         } else {
-            /* Zero-copy style inline struct assignment where possible */
             struct PktDual dual;
-            dual.seq = in_pkt->seq; /* Keep big-endian */
+            dual.seq = htonl(host_seq);
             memcpy(dual.payload_curr, in_pkt->payload, PAYLOAD_LEN);
             memcpy(dual.payload_prev, prev_payload, PAYLOAD_LEN);
             
@@ -90,7 +86,6 @@ int main(void)
             dual_sent++;
         }
 
-        /* Save current payload for next iteration */
         memcpy(prev_payload, in_pkt->payload, PAYLOAD_LEN);
     }
     return 0;
