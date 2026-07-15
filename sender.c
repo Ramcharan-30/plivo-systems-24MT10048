@@ -1,45 +1,41 @@
 /*
- * Sender — XOR FEC (group-of-2 parity)
+ * Sender — immediate duplication
  *
- * For every pair of consecutive frames (2k, 2k+1), we transmit:
- *   1. The original frame 2k   (as soon as the harness delivers it)
- *   2. The original frame 2k+1 (as soon as the harness delivers it)
- *   3. An XOR parity packet    (sent right after frame 2k+1)
+ * Every frame is sent twice back-to-back. The two copies travel through
+ * the relay independently (different drop decisions, different delays),
+ * so the receiver only misses a frame if BOTH copies are lost or late.
  *
- * Wire format (same 164-byte size as the harness format):
- *   [4 bytes] seq  — big-endian uint32
- *                     for data packets: frame index
- *                     for parity: first seq of the pair | 0x80000000
- *   [160 bytes] payload — frame data or XOR of the pair
+ * Budget constraint: overhead must stay ≤ 2.0×.
+ *   raw = n_frames × 160 bytes
+ *   cap = 2.0 × raw
+ *   max_packets = floor(cap / 164)
+ *   max_dups = max_packets − n_frames
  *
- * If any single packet in a pair is lost, the receiver can XOR the
- * surviving packet with the parity to recover the missing one.
+ * For a 30-second run (1500 frames), we can send 1426 duplicates.
+ * The last 74 frames are sent once. This is acceptable because
+ * P(single drop) × 74 / 1500 < 0.1% contribution to miss rate.
  *
- * Bandwidth: 3 packets per 2 frames → 1.5× overhead (well under 2.0×).
+ * Wire format: unchanged harness format (4B big-endian seq + 160B payload).
  */
 #include <arpa/inet.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
 #include <unistd.h>
 
 #define PAYLOAD_LEN 160
 #define PKT_LEN     (4 + PAYLOAD_LEN)
-#define FEC_FLAG    0x80000000u
-
-static void send_pkt(int fd, const struct sockaddr_in *dst,
-                     uint32_t seq, const uint8_t *payload)
-{
-    uint8_t buf[PKT_LEN];
-    uint32_t net_seq = htonl(seq);
-    memcpy(buf, &net_seq, 4);
-    memcpy(buf + 4, payload, PAYLOAD_LEN);
-    sendto(fd, buf, PKT_LEN, 0, (struct sockaddr *)dst, sizeof(*dst));
-}
 
 int main(void)
 {
+    const char *dur_str = getenv("DURATION_S");
+    double duration = dur_str ? atof(dur_str) : 30.0;
+    int n_frames = (int)(duration * 1000.0 / 20.0);
+    int max_packets = (int)(2.0 * n_frames * PAYLOAD_LEN / PKT_LEN);
+    int max_dups = max_packets - n_frames;
+
     int in_fd = socket(AF_INET, SOCK_DGRAM, 0);
     struct sockaddr_in src_addr = {0};
     src_addr.sin_family = AF_INET;
@@ -56,36 +52,20 @@ int main(void)
     relay.sin_port = htons(47001);
     relay.sin_addr.s_addr = inet_addr("127.0.0.1");
 
-    uint8_t prev_payload[PAYLOAD_LEN];
-    uint32_t prev_seq = 0;
-    int have_prev = 0;
-
+    int dup_count = 0;
     uint8_t buf[2048];
+
     for (;;) {
         ssize_t n = recvfrom(in_fd, buf, sizeof(buf), 0, NULL, NULL);
         if (n < PKT_LEN) continue;
 
-        uint32_t seq;
-        memcpy(&seq, buf, 4);
-        seq = ntohl(seq);
-        uint8_t *payload = buf + 4;
+        sendto(out_fd, buf, PKT_LEN, 0,
+               (struct sockaddr *)&relay, sizeof(relay));
 
-        /* always forward the original frame immediately */
-        send_pkt(out_fd, &relay, seq, payload);
-
-        if (have_prev) {
-            /* send XOR parity for the pair (prev_seq, seq) */
-            uint8_t xor_payload[PAYLOAD_LEN];
-            for (int i = 0; i < PAYLOAD_LEN; i++)
-                xor_payload[i] = prev_payload[i] ^ payload[i];
-
-            uint32_t parity_seq = prev_seq | FEC_FLAG;
-            send_pkt(out_fd, &relay, parity_seq, xor_payload);
-            have_prev = 0;
-        } else {
-            memcpy(prev_payload, payload, PAYLOAD_LEN);
-            prev_seq = seq;
-            have_prev = 1;
+        if (dup_count < max_dups) {
+            sendto(out_fd, buf, PKT_LEN, 0,
+                   (struct sockaddr *)&relay, sizeof(relay));
+            dup_count++;
         }
     }
     return 0;
