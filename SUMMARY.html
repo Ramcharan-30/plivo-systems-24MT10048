@@ -1,0 +1,146 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Flaky Network — Architecture Summary</title>
+<style>
+  body { font-family: system-ui, sans-serif; max-width: 800px; margin: 2em auto; line-height: 1.6; color: #222; padding: 0 1em; }
+  h1 { border-bottom: 2px solid #333; padding-bottom: 0.3em; }
+  h2 { color: #444; margin-top: 2em; }
+  code { background: #f4f4f4; padding: 0.15em 0.4em; border-radius: 3px; font-size: 0.95em; }
+  pre { background: #f4f4f4; padding: 1em; border-radius: 6px; overflow-x: auto; }
+  .diagram { font-family: monospace; white-space: pre; background: #f9f9f9; padding: 1em; border: 1px solid #ddd; border-radius: 6px; }
+  table { border-collapse: collapse; width: 100%; margin: 1em 0; }
+  th, td { border: 1px solid #ccc; padding: 0.5em 0.8em; text-align: left; }
+  th { background: #f0f0f0; }
+  .metric { font-weight: bold; color: #2a7; }
+</style>
+</head>
+<body>
+
+<h1>The Flaky Network — Architecture Summary</h1>
+
+<h2>Overview</h2>
+<p>
+  This solution reliably streams 160-byte audio frames across a hostile UDP
+  relay using <strong>immediate packet duplication</strong>. The sender
+  transmits each frame twice in rapid succession; the receiver deduplicates
+  and forwards immediately. No feedback channel, no retransmissions, no
+  jitter buffer.
+</p>
+
+<h2>Data Flow</h2>
+<div class="diagram">
+harness source ──47010──▶ SENDER ──47001──▶ relay ──47002──▶ RECEIVER ──47020──▶ harness player
+                          │    │                              │
+                          │ sends each frame                  │ deduplicates
+                          │ twice (back-to-back)              │ forwards immediately
+                          │                                   │
+                          └── no feedback used ───────────────┘
+</div>
+
+<h2>Sender Design</h2>
+<p>
+  When the harness delivers frame <em>i</em> (4-byte big-endian seq +
+  160-byte payload), the sender:
+</p>
+<ol>
+  <li>Forwards the packet to the relay as-is (164 bytes).</li>
+  <li>Immediately sends a second identical copy.</li>
+</ol>
+<p>
+  The two copies are processed by the relay independently — each gets its
+  own drop decision, its own random delay, and its own duplication chance.
+  A frame is only lost if <em>both</em> copies are dropped or arrive after
+  the deadline.
+</p>
+
+<h3>Budget Management</h3>
+<p>
+  The bandwidth cap is 2.0× the raw stream. With 164 bytes per packet and
+  160-byte payloads, the 4-byte header overhead limits us:
+</p>
+<pre>
+raw         = n_frames × 160 bytes
+cap         = 2.0 × raw
+max_packets = floor(cap / 164)
+max_dups    = max_packets − n_frames
+</pre>
+<p>
+  For a 30-second run (1500 frames): max_packets = 2926, max_dups = 1426.
+  The last 74 frames are sent without duplication. Their contribution to
+  the overall miss rate is small: 74 × loss_rate / 1500.
+</p>
+
+<h2>Receiver Design</h2>
+<p>
+  The receiver's logic is deliberately minimal:
+</p>
+<ol>
+  <li>Receive a packet from the relay on port 47002.</li>
+  <li>Extract the 4-byte sequence number.</li>
+  <li>If this seq has not been delivered yet, forward the packet to the
+      harness player on port 47020 and mark it delivered.</li>
+  <li>Otherwise, discard (deduplicate).</li>
+</ol>
+<p>
+  There is no jitter buffer or playout timer. The harness player only checks
+  whether each frame arrived <em>before</em> its deadline — delivering early
+  is strictly better. A simple boolean array (<code>delivered[seq]</code>)
+  handles deduplication in O(1).
+</p>
+
+<h2>Why Not ARQ (Retransmission)?</h2>
+<p>
+  Automatic Repeat reQuest requires a feedback path through the relay. Both
+  the NACK and the retransmitted frame must cross the hostile network,
+  incurring at least 2× the one-way delay. With relay delays up to 80ms,
+  the round trip is 40–160ms — often exceeding the playout deadline. FEC
+  or duplication avoids this penalty entirely by sending redundancy
+  proactively.
+</p>
+
+<h2>Why Not XOR FEC?</h2>
+<p>
+  XOR forward error correction (parity over pairs of frames) was
+  considered and prototyped. It uses less bandwidth (1.5× vs 2.0×) but has
+  a timing problem: the parity for frames (2k, 2k+1) cannot be sent until
+  frame 2k+1 arrives, 20ms after frame 2k. If frame 2k's original is
+  dropped, recovery depends on the parity arriving before 2k's deadline —
+  which often fails when the relay delay is close to the playout budget.
+  Immediate duplication avoids this because both copies of every frame are
+  sent at the same time.
+</p>
+
+<h2>Results</h2>
+<table>
+  <tr><th>Profile</th><th>delay_ms</th><th>Misses</th><th>Miss %</th><th>Overhead</th><th>Result</th></tr>
+  <tr><td>A_mild</td><td>40</td><td>6</td><td class="metric">0.40%</td><td>2.00×</td><td class="metric">VALID</td></tr>
+  <tr><td>A_mild (seed 2)</td><td>40</td><td>7</td><td class="metric">0.47%</td><td>2.00×</td><td class="metric">VALID</td></tr>
+  <tr><td>B_moderate</td><td>82</td><td>11</td><td class="metric">0.73%</td><td>2.00×</td><td class="metric">VALID</td></tr>
+  <tr><td>B_moderate (seed 2)</td><td>82</td><td>5</td><td class="metric">0.33%</td><td>2.00×</td><td class="metric">VALID</td></tr>
+</table>
+
+<h2>Choosing delay_ms</h2>
+<p>
+  The playout delay must exceed the maximum one-way relay delay to avoid
+  systematic timing misses. A 2ms margin absorbs processing overhead
+  across the five-process pipeline (harness source → sender → relay →
+  receiver → harness player). Rule of thumb:
+</p>
+<pre>delay_ms = max_relay_delay_ms + 2</pre>
+
+<h2>Limitations</h2>
+<ul>
+  <li><strong>Burst losses</strong>: both copies are sent back-to-back and
+      may be processed by the relay during the same loss burst. A
+      Gilbert-Elliott model with long bursts can defeat duplication.</li>
+  <li><strong>High loss rates</strong>: above ~7%, the 74 unprotected tail
+      frames contribute more than 0.3% to the miss rate, shrinking the
+      margin for duplicated frames.</li>
+  <li><strong>Delay spikes</strong>: any spike exceeding delay_ms causes a
+      miss regardless of duplication — only increasing delay_ms helps.</li>
+</ul>
+
+</body>
+</html>
